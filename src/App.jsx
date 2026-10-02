@@ -2,9 +2,10 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Box, IconButton, Typography, Button, TextField,
   List, ListItem, ListItemButton, ListItemText, Avatar, Paper, Stack,
-  CssBaseline, createTheme, ThemeProvider, CircularProgress
+  CssBaseline, createTheme, ThemeProvider, CircularProgress,
+  FormControl, InputLabel, MenuItem, Select
 } from '@mui/material';
-import { Add as AddIcon, Settings as SettingsIcon,
+import { Add as AddIcon,
          Brightness4 as DarkModeIcon, Brightness7 as LightModeIcon, Send as SendIcon,
          SmartToy as BotIcon, Person as UserIcon } from '@mui/icons-material';
 import { v4 as uuidv4 } from 'uuid';
@@ -59,10 +60,31 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [currentInput, setCurrentInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [ragMode, setRagMode] = useState('default');
+  const [historyLength, setHistoryLength] = useState(3);
   // State to manage the current theme mode
   const [themeMode, setThemeMode] = useState('dark');
   const chatEndRef = useRef(null); // Ref to the end of the chat messages
   const isMounted = useRef(false);
+
+  const formatDateTime = (value) => {
+    if (!value) return '';
+    const dateValue = new Date(value);
+    return Number.isNaN(dateValue.getTime()) ? value : dateValue.toLocaleString();
+  };
+
+  const getModeLabel = (mode) => {
+    switch (mode) {
+      case 'rewrite query':
+        return 'Rewrite query';
+      case 'embedding history':
+        return 'Embed History';
+      case 'ctqe':
+        return 'CTQE';
+      default:
+        return 'Default';
+    }
+  };
 
   // Scroll to the bottom of the chat history whenever it updates
   useEffect(() => {
@@ -87,9 +109,10 @@ function App() {
     // Get the current session
     const currentSessionIndex = sessions.findIndex(s => s.id === activeSessionId);
     if (currentSessionIndex === -1) return;
-    const currentSession = sessions[currentSessionIndex];
 
     // Add user message to the active session's history
+    const sentAt = new Date();
+    const requestStartedAt = performance.now();
     const newUserMessage = { id: uuidv4(), author: 'user', content: currentInput };
     const updatedSessionsWithUserMsg = [...sessions];
     updatedSessionsWithUserMsg[currentSessionIndex].chatHistory.push(newUserMessage);
@@ -105,7 +128,11 @@ function App() {
     updatedSessionsWithPlaceholder[currentSessionIndex].chatHistory.push({
       id: assistantPlaceholderId,
       author: 'assistant',
-      content: ''
+      content: '',
+      meta: {
+        mode: ragMode,
+        sentAt: sentAt.toISOString(),
+      }
     });
     setSessions(updatedSessionsWithPlaceholder);
 
@@ -113,8 +140,15 @@ function App() {
       const response = await fetch("http://localhost:8000/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: activeSessionId, message: inputToSend })
+        body: JSON.stringify({
+          session_id: activeSessionId,
+          message: inputToSend,
+          rag_mode: ragMode,
+          history_length: historyLength,
+        })
       });
+
+      const serverTime = response.headers.get('x-server-time');
       
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -131,13 +165,44 @@ function App() {
             return {
               ...session,
               chatHistory: session.chatHistory.map(msg =>
-                msg.id === assistantPlaceholderId ? { ...msg, content: assistantText } : msg
+                msg.id === assistantPlaceholderId ? {
+                  ...msg,
+                  content: assistantText,
+                  meta: {
+                    ...(msg.meta || {}),
+                    serverTime: serverTime || msg.meta?.serverTime,
+                    receivedAt: msg.meta?.receivedAt || null,
+                    latencyMs: msg.meta?.latencyMs || null,
+                  }
+                } : msg
               )
             };
           }
           return session;
         }));
       }
+
+      const receivedAt = new Date();
+      const latencyMs = Math.round(performance.now() - requestStartedAt);
+      setSessions(prevSessions => prevSessions.map(session => {
+        if (session.id === activeSessionId) {
+          return {
+            ...session,
+            chatHistory: session.chatHistory.map(msg =>
+              msg.id === assistantPlaceholderId ? {
+                ...msg,
+                meta: {
+                  ...(msg.meta || {}),
+                  serverTime: serverTime || receivedAt.toISOString(),
+                  receivedAt: receivedAt.toISOString(),
+                  latencyMs,
+                }
+              } : msg
+            )
+          };
+        }
+        return session;
+      }));
     } catch (error) {
       console.error("Streaming error:", error);
       // Handle error by setting an error message
@@ -160,7 +225,14 @@ function App() {
   const handleNewConversation = async () => {
     setConnected(false);
     try {
-      const res = await fetch("http://localhost:8000/session/start", { method: "POST" });
+      const res = await fetch("http://localhost:8000/session/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rag_mode: ragMode,
+          history_length: historyLength,
+        })
+      });
       const data = await res.json();
       const newSession = {
         id: data.session_id,
@@ -216,17 +288,48 @@ function App() {
               </ListItem>
             ))}
           </List>
-          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-            <Button 
-              onClick={toggleTheme}
-              startIcon={themeMode === 'dark' ? <DarkModeIcon /> : <LightModeIcon />}
-              sx={{ color: 'text.primary', '&:hover': { bgcolor: 'rgba(255, 255, 255, 0.08)' } }}
-            >
-              {themeMode === 'dark' ? 'Dark' : 'Light'}
-            </Button>
-            <Button startIcon={<SettingsIcon />} sx={{ color: 'text.primary', '&:hover': { bgcolor: 'rgba(255, 255, 255, 0.08)' } }}>
-              Settings
-            </Button>
+          <Box sx={{ mt: 2, p: 1.5, borderRadius: 2, bgcolor: 'action.hover', border: '1px solid', borderColor: 'divider' }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+              <Typography variant="caption" sx={{ letterSpacing: 1, textTransform: 'uppercase', color: 'text.secondary' }}>
+                Controls
+              </Typography>
+              <Button
+                onClick={toggleTheme}
+                size="small"
+                variant="outlined"
+                startIcon={themeMode === 'dark' ? <DarkModeIcon /> : <LightModeIcon />}
+                sx={{ minWidth: 0, px: 1.2, py: 0.5, borderRadius: 999, textTransform: 'none' }}
+              >
+                {themeMode === 'dark' ? 'Dark' : 'Light'}
+              </Button>
+            </Box>
+
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControl fullWidth size="small">
+                <InputLabel id="rag-mode-label">Mode</InputLabel>
+                <Select
+                  labelId="rag-mode-label"
+                  value={ragMode}
+                  label="Mode"
+                  onChange={(e) => setRagMode(e.target.value)}
+                >
+                  <MenuItem value="rewrite query">Rewrite</MenuItem>
+                  <MenuItem value="embedding history">Embed History</MenuItem>
+                  <MenuItem value="ctqe">CTQE</MenuItem>
+                  <MenuItem value="default">Default</MenuItem>
+                </Select>
+              </FormControl>
+
+              <TextField
+                fullWidth
+                size="small"
+                label="Turns"
+                type="number"
+                value={historyLength}
+                onChange={(e) => setHistoryLength(Math.max(1, Number(e.target.value) || 1))}
+                inputProps={{ min: 1, step: 1 }}
+              />
+            </Box>
           </Box>
         </Box>
 
@@ -266,6 +369,11 @@ function App() {
                       <Typography variant="body1">
                         {msg.content}
                       </Typography>
+                      {msg.author === 'assistant' && msg.meta && (
+                        <Typography variant="caption" sx={{ display: 'block', mt: 1, color: 'text.secondary' }}>
+                          {getModeLabel(msg.meta.mode)} · Sent {formatDateTime(msg.meta.sentAt)} · Received {formatDateTime(msg.meta.receivedAt || msg.meta.serverTime)} · {msg.meta.latencyMs != null ? `${msg.meta.latencyMs} ms` : 'timing pending'}
+                        </Typography>
+                      )}
                     </Paper>
                     {msg.author === 'user' && (
                       <Avatar sx={{ bgcolor: 'grey.700', width: 40, height: 40 }}><UserIcon /></Avatar>
